@@ -1780,14 +1780,8 @@
                                     const s = Math.max(-1, Math.min(1, this.buffer[j]));
                                     int16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                                 }
-                                // Convert to base64
-                                const bytes = new Uint8Array(int16.buffer);
-                                let binary = '';
-                                for (let k = 0; k < bytes.length; k++) {
-                                    binary += String.fromCharCode(bytes[k]);
-                                }
-                                const base64 = btoa(binary);
-                                this.port.postMessage({ type: 'audio', data: base64 });
+                                // Post the raw Int16Array back to main thread
+                                this.port.postMessage({ type: 'audio', data: int16 }, [int16.buffer]);
                                 this.bufferIndex = 0;
                             }
                         }
@@ -1798,15 +1792,54 @@
             registerProcessor('pcm-processor', PCMProcessor);
         `;
 
+        async function startLiveMic() {
+            try {
+                if (!liveAudioContext) {
+                    liveAudioContext = new AudioContext({ sampleRate: 16000 });
+                }
+                
+                const blob = new Blob([PCM_WORKLET_CODE], { type: 'application/javascript' });
+                const workletUrl = URL.createObjectURL(blob);
+                await liveAudioContext.audioWorklet.addModule(workletUrl);
+                URL.revokeObjectURL(workletUrl);
+                
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = liveAudioContext.createMediaStreamSource(stream);
+                
+                liveMicWorkletNode = new AudioWorkletNode(liveAudioContext, 'pcm-processor');
+                source.connect(liveMicWorkletNode);
+                
+                liveMicWorkletNode.port.onmessage = (event) => {
+                    if (event.data.type === 'audio' && liveIsConnected && liveWs && liveWs.readyState === WebSocket.OPEN) {
+                        const int16 = event.data.data;
+                        const bytes = new Uint8Array(int16.buffer);
+                        let binary = '';
+                        for (let k = 0; k < bytes.length; k++) {
+                            binary += String.fromCharCode(bytes[k]);
+                        }
+                        const base64 = btoa(binary);
+                        liveWs.send(JSON.stringify({
+                            type: 'audio',
+                            data: base64
+                        }));
+                    }
+                };
+                log('Microphone worklet active. Streaming live audio at 16kHz PCM.', 'audio');
+            } catch (err) {
+                log(`Failed to start live mic capture: ${err.message}`, 'error');
+            }
+        }
+
         function connectLiveAPI() {
             if (liveWs && liveWs.readyState === WebSocket.OPEN) return;
 
             const wsUrl = `ws://localhost:7777/ws/live?session_id=${sessionId || ''}`;
             liveWs = new WebSocket(wsUrl);
 
-            liveWs.onopen = () => {
+            liveWs.onopen = async () => {
                 log('Live API WebSocket connected', 'system');
                 liveIsConnected = true;
+                await startLiveMic();
             };
 
             liveWs.onmessage = (event) => {
@@ -1818,6 +1851,7 @@
                 log('Live API WebSocket closed', 'system');
                 liveIsConnected = false;
                 liveWs = null;
+                cleanupLiveAudio();
             };
 
             liveWs.onerror = (err) => {
@@ -1897,6 +1931,28 @@
             source.start();
         }
 
+        function cleanupLiveAudio() {
+            if (liveMicWorkletNode) {
+                try {
+                    liveMicWorkletNode.port.onmessage = null;
+                    liveMicWorkletNode.disconnect();
+                } catch (e) {}
+                liveMicWorkletNode = null;
+            }
+            if (liveAudioContext) {
+                try {
+                    liveAudioContext.close();
+                } catch (e) {}
+                liveAudioContext = null;
+            }
+            if (livePlaybackContext) {
+                try {
+                    livePlaybackContext.close();
+                } catch (e) {}
+                livePlaybackContext = null;
+            }
+        }
+
         async function startLiveSession() {
             liveMode = true;
             connectLiveAPI();
@@ -1906,8 +1962,9 @@
 
         function stopLiveSession() {
             liveMode = false;
+            cleanupLiveAudio();
             if (liveWs) {
-                liveWs.close();
+                try { liveWs.close(); } catch (e) {}
                 liveWs = null;
             }
             liveIsConnected = false;
