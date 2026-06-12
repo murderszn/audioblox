@@ -2022,14 +2022,35 @@
             sentenceQueue.push(sentence);
             log(`Detected streamed sentence chunk: "${sentence.substring(0, 40)}..."`, 'speech');
             
-            // Start fetching synthesis in background immediately
-            synthesizeSentence(sentence, index);
+            // Batch pending sentences and synthesize together to reduce API calls
+            if (!window._ttsBatchTimeout) {
+                window._ttsBatchTimeout = setTimeout(() => {
+                    window._ttsBatchTimeout = null;
+                    synthesizePendingSentences();
+                }, 50); // 50ms batching window
+            }
+        }
+
+        async function synthesizePendingSentences() {
+            const pending = [];
+            for (let i = 0; i < sentenceQueue.length; i++) {
+                if (!audioQueue[i]) {
+                    pending.push({ index: i, sentence: sentenceQueue[i] });
+                }
+            }
+            
+            if (pending.length === 0) return;
+            
+            // Fire all synthesis requests in parallel (avoids waiting for batch overhead)
+            for (const p of pending) {
+                synthesizeSentence(p.sentence, p.index);
+            }
         }
 
         async function synthesizeSentence(sentence, index) {
             try {
-                const response = await fetch(`${SERVER_URL}/synthesize`, {
-                    method: 'POST',
+                const response = await fetch(`${SERVER_URL}/synthesize_wav`, {
+                    method: 'POST', 
                     headers: { 
                         'Content-Type': 'application/json',
                         'Session-ID': sessionId
@@ -2216,8 +2237,8 @@
                     // Parse sentence chunks in streamBuffer
                     streamBuffer += chunk;
                     
-                    // Split on sentence terminals: . ? ! followed by a space, or newline
-                    const sentenceRegex = /([^.!?\n]+[.!?\n]+)(?:\s+|$)/g;
+                    // Split on sentence terminals: . ? ! followed by space/newline, or comma for long clauses (>30 chars)
+                    const sentenceRegex = /([^.!?\n]+[.!?](?:\s+|$)|[^,]{30,},(?:\s+|$))/g;
                     let match;
                     while ((match = sentenceRegex.exec(streamBuffer)) !== null) {
                         const sentence = match[1].trim();

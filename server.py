@@ -13,7 +13,7 @@ Key Features:
 - Async task processing
 """
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from google import genai
 from google.genai import types
@@ -21,10 +21,11 @@ import os
 from dotenv import load_dotenv
 import time
 import io
-import asyncio
 import threading
 from queue import Queue
 import re
+import hashlib
+from functools import lru_cache
 import wave
 
 # Initialize Flask app with CORS support
@@ -40,16 +41,25 @@ CORS(app, resources={
 # Load environment variables from .env file
 load_dotenv()
 
-# Lazy initializer for GenAI client
+# Eagerly initialize GenAI client at import time for lower latency
 genai_client = None
 
-def get_genai_client():
+def _init_genai_client():
     global genai_client
     if genai_client is None:
         api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GOOGLE_GENERATIVE_LANGUAGE_API_KEY')
-        if not api_key:
-            raise Exception("GOOGLE_API_KEY is not configured in the environment variables.")
-        genai_client = genai.Client(api_key=api_key)
+        if api_key:
+            genai_client = genai.Client(api_key=api_key)
+    return genai_client
+
+# Pre-initialize at module load
+_init_genai_client()
+
+def get_genai_client():
+    if genai_client is None:
+        _init_genai_client()
+    if genai_client is None:
+        raise Exception("GOOGLE_API_KEY is not configured in the environment variables.")
     return genai_client
 
 # Task processing queue and patterns
@@ -102,58 +112,44 @@ def check_principal_command(text):
 
 def clean_text_for_speech(text):
     """
-    Clean text by removing markdown formatting and other symbols that shouldn't be spoken.
-    
-    Args:
-        text (str): The text to clean
-        
-    Returns:
-        str: Cleaned text ready for speech synthesis
+    Fast text cleaning for speech synthesis.
+    Removes markdown formatting that shouldn't be spoken.
     """
-    # Remove markdown bold/italic
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # Bold
-    text = re.sub(r'\*(.+?)\*', r'\1', text)      # Italic
-    text = re.sub(r'\_(.+?)\_', r'\1', text)      # Underscore emphasis
-    
-    # Remove markdown links
+    # Fast path: strip markdown in one pass
+    text = re.sub(r'\*\*(.+?)\*\*|\*(.+?)\*|\_(.+?)\_', lambda m: m.group(1) or m.group(2) or m.group(3), text)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
-    
-    # Remove markdown code blocks and inline code
     text = re.sub(r'```[\s\S]*?```', '', text)
     text = re.sub(r'`(.+?)`', r'\1', text)
-    
-    # Remove markdown headers
     text = re.sub(r'#{1,6}\s+', '', text)
-    
-    # Remove bullet points and numbering
     text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-    
-    # Remove extra whitespace
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip()
-    
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+# TTS cache: maps (text_hash, voice) -> raw PCM bytes
+_tts_cache = {}
+_tts_cache_lock = threading.Lock()
+_TTS_CACHE_MAX = 200
+
+def _tts_cache_key(text, voice_name):
+    return (hashlib.md5(text.encode()).hexdigest(), voice_name)
 
 def generate_speech(text, voice_name="Puck"):
     """
-    Generate high-quality speech from text using Google's native Gemini conversational TTS model.
-    
-    Args:
-        text (str): The text to convert to speech
-        voice_name (str): The name of the voice configuration to use
-        
-    Returns:
-        bytes: The audio content in WAV format
-        
-    Raises:
-        Exception: If speech generation fails
+    Generate speech from text using Gemini's native TTS model.
+    Returns raw PCM audio bytes (16-bit, 24kHz mono).
+    Uses in-memory cache for repeated sentences.
     """
+    cleaned_text = clean_text_for_speech(text)
+    cache_key = _tts_cache_key(cleaned_text, voice_name)
+
+    # Check cache first
+    with _tts_cache_lock:
+        if cache_key in _tts_cache:
+            return _tts_cache[cache_key]
+
     try:
-        # Clean the text before synthesis
-        cleaned_text = clean_text_for_speech(text)
-        
-        # Call Gemini TTS Model
         client = get_genai_client()
         response = client.models.generate_content(
             model="gemini-2.5-flash-preview-tts",
@@ -169,27 +165,38 @@ def generate_speech(text, voice_name="Puck"):
                 )
             )
         )
-        
+
         audio_data = None
         for part in response.candidates[0].content.parts:
             if part.inline_data:
                 audio_data = part.inline_data.data
                 break
-                
+
         if not audio_data:
             raise Exception("No audio data returned from Gemini TTS")
-            
-        # Convert raw linear PCM (16-bit, 24kHz mono) to WAV format
-        wav_buf = io.BytesIO()
-        with wave.open(wav_buf, 'wb') as wav_file:
-            wav_file.setnchannels(1)      # Mono
-            wav_file.setsampwidth(2)      # 16-bit
-            wav_file.setframerate(24000)  # 24kHz
-            wav_file.writeframes(audio_data)
-            
-        return wav_buf.getvalue()
+
+        # Cache the result (evict oldest if at capacity)
+        with _tts_cache_lock:
+            if len(_tts_cache) >= _TTS_CACHE_MAX:
+                # Remove first inserted key (FIFO eviction)
+                _tts_cache.pop(next(iter(_tts_cache)))
+            _tts_cache[cache_key] = audio_data
+
+        return audio_data
     except Exception as e:
         raise Exception(f"Failed to generate speech: {str(e)}")
+
+
+def generate_speech_wav(text, voice_name="Puck"):
+    """Generate speech and return as WAV format bytes."""
+    pcm_data = generate_speech(text, voice_name)
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(pcm_data)
+    return wav_buf.getvalue()
 
 def init_gemini(api_key):
     """
@@ -210,9 +217,8 @@ def init_gemini(api_key):
             model="gemini-2.5-flash",
             config=types.GenerateContentConfig(
                 temperature=0.7,
-                top_p=1.0,
-                top_k=1,
-                max_output_tokens=2048,
+                top_p=0.95,
+                max_output_tokens=150,
                 safety_settings=[
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -304,7 +310,7 @@ def init_session():
 
 @app.route('/synthesize', methods=['POST', 'OPTIONS'])
 def synthesize_speech():
-    """Generate speech from text"""
+    """Generate speech from text. Returns raw PCM (16-bit, 24kHz, mono)."""
     if request.method == 'OPTIONS':
         return '', 204
     try:
@@ -318,13 +324,80 @@ def synthesize_speech():
         if session_id and session_id in chat_sessions:
             voice_name = chat_sessions[session_id].get('voice', 'Puck')
 
-        audio_content = generate_speech(text, voice_name=voice_name)
-        
-        return send_file(
-            io.BytesIO(audio_content),
+        pcm_data = generate_speech(text, voice_name=voice_name)
+
+        return Response(
+            pcm_data,
+            mimetype='audio/pcm',
+            headers={
+                'Content-Type': 'audio/pcm',
+                'X-Sample-Rate': '24000',
+                'X-Channels': '1',
+                'X-Bits-Per-Sample': '16'
+            }
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/synthesize_wav', methods=['POST', 'OPTIONS'])
+def synthesize_speech_wav():
+    """Generate speech from text. Returns WAV format."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        data = request.json
+        text = data.get('text')
+        if not text:
+            return jsonify({'error': 'Text is required'}), 400
+
+        session_id = request.headers.get('Session-ID')
+        voice_name = 'Puck'
+        if session_id and session_id in chat_sessions:
+            voice_name = chat_sessions[session_id].get('voice', 'Puck')
+
+        wav_data = generate_speech_wav(text, voice_name=voice_name)
+
+        return Response(
+            wav_data,
             mimetype='audio/wav',
-            as_attachment=True,
-            download_name='response.wav'
+            headers={'Content-Disposition': 'attachment; filename=response.wav'}
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/synthesize_batch', methods=['POST', 'OPTIONS'])
+def synthesize_batch():
+    """Synthesize multiple sentences in one call. Returns concatenated raw PCM."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        data = request.json
+        sentences = data.get('sentences', [])
+        if not sentences:
+            return jsonify({'error': 'Sentences list is required'}), 400
+
+        session_id = request.headers.get('Session-ID')
+        voice_name = 'Puck'
+        if session_id and session_id in chat_sessions:
+            voice_name = chat_sessions[session_id].get('voice', 'Puck')
+
+        # Synthesize all sentences and concatenate PCM
+        all_pcm = b''
+        for sentence in sentences:
+            if sentence and sentence.strip():
+                pcm = generate_speech(sentence.strip(), voice_name=voice_name)
+                all_pcm += pcm
+
+        return Response(
+            all_pcm,
+            mimetype='audio/pcm',
+            headers={
+                'X-Sample-Rate': '24000',
+                'X-Channels': '1',
+                'X-Bits-Per-Sample': '16'
+            }
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
