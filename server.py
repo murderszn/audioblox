@@ -521,7 +521,7 @@ def live_api_proxy(ws):
         asyncio.set_event_loop(loop)
 
         async def gemini_session():
-            client = genai.Client(api_key=api_key)
+            client = get_genai_client()
             model = "gemini-2.5-flash-native-audio-latest"
             config = {
                 "response_modalities": ["AUDIO"],
@@ -588,7 +588,13 @@ def live_api_proxy(ws):
                                         )
                                     )
                                 elif msg["type"] == "text":
-                                    await session.send_realtime_input(text=msg["text"])
+                                    await session.send_client_content(
+                                        turns=[types.Content(
+                                            role="user",
+                                            parts=[types.Part.from_text(text=msg["text"])]
+                                        )],
+                                        turn_complete=True
+                                    )
                                 elif msg["type"] == "end_of_turn":
                                     # Send empty turn marker
                                     pass
@@ -598,10 +604,17 @@ def live_api_proxy(ws):
                                 "text": f"Send error: {str(e)}"
                             }))
 
-                    await asyncio.gather(
-                        send_to_gemini(),
-                        receive_from_gemini()
+                    # Use asyncio.wait with return_when=FIRST_COMPLETED to ensure when either sender or receiver
+                    # ends (e.g. on disconnect), the other is cancelled and we clean up properly.
+                    done, pending = await asyncio.wait(
+                        [
+                            asyncio.create_task(send_to_gemini()),
+                            asyncio.create_task(receive_from_gemini())
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED
                     )
+                    for task in pending:
+                        task.cancel()
             except Exception as e:
                 gemini_to_client.put(json.dumps({
                     "type": "error",
