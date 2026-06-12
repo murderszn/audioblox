@@ -27,9 +27,13 @@ import re
 import hashlib
 from functools import lru_cache
 import wave
+import json
+import asyncio
+from flask_sock import Sock
 
 # Initialize Flask app with CORS support
 app = Flask(__name__, static_folder='.', static_url_path='')
+sock = Sock(app)
 CORS(app, resources={
     r"/*": {
         "origins": ["http://localhost:8000", "http://127.0.0.1:8000", "http://localhost:7777", "http://127.0.0.1:7777"],
@@ -52,7 +56,7 @@ def _init_genai_client():
             genai_client = genai.Client(api_key=api_key)
     return genai_client
 
-# Pre-initialize at module load
+# Pre-initialize at module load (after load_dotenv)
 _init_genai_client()
 
 def get_genai_client():
@@ -480,6 +484,186 @@ def chat():
         return app.response_class(generate(), mimetype='text/plain')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ─── Gemini Live API WebSocket Proxy ────────────────────────────────────────
+
+@sock.route('/ws/live')
+def live_api_proxy(ws):
+    """
+    WebSocket proxy for Gemini Live API.
+    Client sends: {"type": "audio", "data": "<base64 PCM>"}
+                    {"type": "text",  "text": "message"}
+                    {"type": "end_of_turn"}
+                    {"type": "config", "voice": "Puck"}
+    Server sends: {"type": "audio", "data": "<base64 PCM>"}
+                   {"type": "text",  "text": "..."}
+                   {"type": "turn_complete"}
+                   {"type": "interrupted"}
+    """
+    api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GOOGLE_GENERATIVE_LANGUAGE_API_KEY')
+    if not api_key:
+        ws.send(json.dumps({"type": "error", "text": "API key not configured"}))
+        return
+
+    # Get voice from session or default
+    session_id = request.args.get('session_id', '')
+    voice_name = 'Puck'
+    if session_id and session_id in chat_sessions:
+        voice_name = chat_sessions[session_id].get('voice', 'Puck')
+
+    client_to_gemini = Queue(maxsize=64)
+    gemini_to_client = Queue(maxsize=64)
+
+    def run_gemini_live():
+        """Run the async Gemini Live session in a background thread."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def gemini_session():
+            client = genai.Client(api_key=api_key)
+            model = "gemini-2.5-flash-native-audio-latest"
+            config = {
+                "response_modalities": ["AUDIO"],
+                "speech_config": types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
+                    )
+                ),
+                "system_instruction": types.Content(
+                    parts=[types.Part.from_text(
+                        text="You are a warm, natural, and engaging voice assistant. Keep responses conversational and concise (1-3 sentences). Never use markdown or formatting. Respond naturally like a human in a live voice conversation."
+                    )]
+                ),
+            }
+
+            try:
+                async with client.aio.live.connect(model=model, config=config) as session:
+                    gemini_to_client.put(json.dumps({"type": "connected"}))
+
+                    async def receive_from_gemini():
+                        try:
+                            async for response in session.receive():
+                                if response.data is not None:
+                                    import base64
+                                    audio_b64 = base64.b64encode(response.data).decode()
+                                    gemini_to_client.put(json.dumps({
+                                        "type": "audio",
+                                        "data": audio_b64
+                                    }))
+                                if response.text is not None:
+                                    gemini_to_client.put(json.dumps({
+                                        "type": "text",
+                                        "text": response.text
+                                    }))
+                                if response.turn_complete:
+                                    gemini_to_client.put(json.dumps({
+                                        "type": "turn_complete"
+                                    }))
+                                if response.interrupted:
+                                    gemini_to_client.put(json.dumps({
+                                        "type": "interrupted"
+                                    }))
+                        except Exception as e:
+                            gemini_to_client.put(json.dumps({
+                                "type": "error",
+                                "text": f"Receive error: {str(e)}"
+                            }))
+
+                    async def send_to_gemini():
+                        try:
+                            while True:
+                                msg = client_to_gemini.get()
+                                if msg is None:
+                                    break
+                                import base64
+                                if msg["type"] == "audio":
+                                    audio_bytes = base64.b64decode(msg["data"])
+                                    await session.send_realtime_input(
+                                        audio=types.Blob(
+                                            data=audio_bytes,
+                                            mime_type="audio/pcm;rate=16000"
+                                        )
+                                    )
+                                elif msg["type"] == "text":
+                                    await session.send_realtime_input(text=msg["text"])
+                                elif msg["type"] == "end_of_turn":
+                                    # Send empty turn marker
+                                    pass
+                        except Exception as e:
+                            gemini_to_client.put(json.dumps({
+                                "type": "error",
+                                "text": f"Send error: {str(e)}"
+                            }))
+
+                    await asyncio.gather(
+                        send_to_gemini(),
+                        receive_from_gemini()
+                    )
+            except Exception as e:
+                gemini_to_client.put(json.dumps({
+                    "type": "error",
+                    "text": f"Connection error: {str(e)}"
+                }))
+
+        try:
+            loop.run_until_complete(gemini_session())
+        except Exception as e:
+            gemini_to_client.put(json.dumps({
+                "type": "error",
+                "text": f"Fatal: {str(e)}"
+            }))
+        finally:
+            loop.close()
+
+    # Start Gemini session in background thread
+    gemini_thread = threading.Thread(target=run_gemini_live, daemon=True)
+    gemini_thread.start()
+
+    # Wait for connection confirmation
+    try:
+        conn_msg = gemini_to_client.get(timeout=10)
+        conn_data = json.loads(conn_msg)
+        if conn_data.get("type") == "error":
+            ws.send(conn_msg)
+            return
+    except Exception:
+        ws.send(json.dumps({"type": "error", "text": "Connection timeout"}))
+        return
+
+    # Bidirectional proxy: client <-> Gemini
+    def client_to_gemini_proxy():
+        """Read from client WebSocket, forward to Gemini."""
+        try:
+            while True:
+                raw = ws.receive()
+                if raw is None:
+                    client_to_gemini.put(None)
+                    break
+                msg = json.loads(raw)
+                client_to_gemini.put(msg)
+        except Exception:
+            client_to_gemini.put(None)
+
+    # Start client reader in background
+    reader_thread = threading.Thread(target=client_to_gemini_proxy, daemon=True)
+    reader_thread.start()
+
+    # Main loop: forward Gemini responses to client
+    try:
+        while True:
+            msg = gemini_to_client.get()
+            ws.send(msg)
+            data = json.loads(msg)
+            if data.get("type") == "error":
+                break
+    except Exception:
+        pass
+    finally:
+        client_to_gemini.put(None)
+
 
 if __name__ == '__main__':
     print("Starting server on http://localhost:7777")

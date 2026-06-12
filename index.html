@@ -1536,6 +1536,7 @@
                                     <div class="visualizer-actions">
                                         <button class="action-btn" onclick="interruptHandler()" title="Interrupt dialogue (Space)">Interrupt</button>
                                         <button class="action-btn" onclick="toggleVoiceMode()" id="mic-control-btn">Voice Mode</button>
+                                        <button class="action-btn" onclick="toggleLiveMode()" id="live-api-btn" title="Switch to real-time Gemini Live API">Live API</button>
                                     </div>
                                 </div>
                             </div>
@@ -1749,6 +1750,171 @@
         let latencyCount = 0;
         let avgLatency = 0;
 
+        // ─── Gemini Live API State ────────────────────────────────────────
+        let liveWs = null;
+        let liveAudioContext = null;
+        let liveMicWorkletNode = null;
+        let livePlaybackContext = null;
+        let liveIsConnected = false;
+        let liveMode = false; // Toggle between REST and Live API
+
+        // AudioWorklet processor for capturing raw PCM from mic
+        const PCM_WORKLET_CODE = `
+            class PCMProcessor extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    this.bufferSize = 1024;
+                    this.buffer = new Float32Array(this.bufferSize);
+                    this.bufferIndex = 0;
+                }
+                process(inputs) {
+                    const input = inputs[0];
+                    if (input && input[0]) {
+                        const channelData = input[0];
+                        for (let i = 0; i < channelData.length; i++) {
+                            this.buffer[this.bufferIndex++] = channelData[i];
+                            if (this.bufferIndex >= this.bufferSize) {
+                                // Convert float32 to int16 PCM
+                                const int16 = new Int16Array(this.bufferSize);
+                                for (let j = 0; j < this.bufferSize; j++) {
+                                    const s = Math.max(-1, Math.min(1, this.buffer[j]));
+                                    int16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                                }
+                                // Convert to base64
+                                const bytes = new Uint8Array(int16.buffer);
+                                let binary = '';
+                                for (let k = 0; k < bytes.length; k++) {
+                                    binary += String.fromCharCode(bytes[k]);
+                                }
+                                const base64 = btoa(binary);
+                                this.port.postMessage({ type: 'audio', data: base64 });
+                                this.bufferIndex = 0;
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('pcm-processor', PCMProcessor);
+        `;
+
+        function connectLiveAPI() {
+            if (liveWs && liveWs.readyState === WebSocket.OPEN) return;
+
+            const wsUrl = `ws://localhost:7777/ws/live?session_id=${sessionId || ''}`;
+            liveWs = new WebSocket(wsUrl);
+
+            liveWs.onopen = () => {
+                log('Live API WebSocket connected', 'system');
+                liveIsConnected = true;
+            };
+
+            liveWs.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                handleLiveMessage(msg);
+            };
+
+            liveWs.onclose = () => {
+                log('Live API WebSocket closed', 'system');
+                liveIsConnected = false;
+                liveWs = null;
+            };
+
+            liveWs.onerror = (err) => {
+                log(`Live API WebSocket error: ${err.message || err}`, 'error');
+                liveIsConnected = false;
+            };
+        }
+
+        function handleLiveMessage(msg) {
+            switch (msg.type) {
+                case 'connected':
+                    log('Gemini Live session ready', 'system');
+                    break;
+                case 'audio':
+                    playLiveAudio(msg.data);
+                    break;
+                case 'text':
+                    if (msg.text) {
+                        currentResponseText += msg.text;
+                        // Update the AI bubble if it exists
+                        const lastBubble = chatMessages.querySelector('.msg-ai:last-child');
+                        if (lastBubble) {
+                            updateMessageBubble(lastBubble, currentResponseText);
+                        }
+                    }
+                    break;
+                case 'turn_complete':
+                    isSpeaking = false;
+                    currentSpeaker = 'none';
+                    isWaitingForResponse = false;
+                    log('Live API turn complete', 'system');
+                    if (isVoiceModeActive) startRecognitionSafe();
+                    break;
+                case 'interrupted':
+                    log('Live API interrupted', 'system');
+                    isSpeaking = false;
+                    currentSpeaker = 'none';
+                    break;
+                case 'error':
+                    log(`Live API error: ${msg.text}`, 'error');
+                    break;
+            }
+        }
+
+        function playLiveAudio(base64PCM) {
+            if (!livePlaybackContext) {
+                livePlaybackContext = new AudioContext({ sampleRate: 24000 });
+            }
+
+            isSpeaking = true;
+            currentSpeaker = 'ai';
+
+            // Decode base64 to Int16Array
+            const binary = atob(base64PCM);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            const int16 = new Int16Array(bytes.buffer);
+
+            // Convert Int16 to Float32
+            const float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) {
+                float32[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7FFF);
+            }
+
+            // Create AudioBuffer and play
+            const audioBuffer = livePlaybackContext.createBuffer(1, float32.length, 24000);
+            audioBuffer.getChannelData(0).set(float32);
+
+            const source = livePlaybackContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(livePlaybackContext.destination);
+            source.onended = () => {
+                // Don't clear speaking state here; turn_complete handles it
+            };
+            source.start();
+        }
+
+        async function startLiveSession() {
+            liveMode = true;
+            connectLiveAPI();
+            log('Switched to Live API mode', 'system');
+            if (statusTextSub) statusTextSub.textContent = "Live API Active";
+        }
+
+        function stopLiveSession() {
+            liveMode = false;
+            if (liveWs) {
+                liveWs.close();
+                liveWs = null;
+            }
+            liveIsConnected = false;
+            log('Switched to REST mode', 'system');
+            if (statusTextSub) statusTextSub.textContent = "";
+        }
+
         // --- Visualizer animation drawing loop ---
         function draw() {
             animationId = requestAnimationFrame(draw);
@@ -1884,6 +2050,20 @@
                 } catch (e) {}
                 currentAudio = null;
             }
+
+            // Stop Live API audio playback
+            if (livePlaybackContext) {
+                try {
+                    livePlaybackContext.close();
+                } catch (e) {}
+                livePlaybackContext = null;
+            }
+
+            // Interrupt Live API session
+            if (liveMode && liveWs && liveWs.readyState === WebSocket.OPEN) {
+                liveWs.send(JSON.stringify({ type: "end_of_turn" }));
+            }
+
             window.speechSynthesis.cancel();
             
             sentenceQueue = [];
@@ -2175,6 +2355,17 @@
             userTurns++;
             updateAnalyticsUI();
 
+            // ─── Live API fast path ──────────────────────────────────────
+            if (liveMode && liveIsConnected && liveWs) {
+                const startTime = performance.now();
+                log(`Live API: sending text "${messageText.substring(0, 50)}..."`, 'info');
+                currentResponseText = "";
+                liveWs.send(JSON.stringify({ type: "text", text: messageText }));
+                liveWs.send(JSON.stringify({ type: "end_of_turn" }));
+                // Turn completion handled by handleLiveMessage -> turn_complete
+                return;
+            }
+
             const startTime = performance.now();
             log(`Posting prompt query to /chat: "${messageText.substring(0, 50)}..."`);
             
@@ -2295,6 +2486,11 @@
                 if (micCtrl) micCtrl.textContent = "Mute Mic";
                 log('Continuous voice dialogue mode engaged', 'system');
                 currentSpeaker = 'user';
+
+                // Auto-connect Live API if available
+                if (sessionId && !liveMode) {
+                    startLiveSession();
+                }
                 startRecognitionSafe();
             } else {
                 micBtn.classList.remove('mic-active');
@@ -2306,6 +2502,25 @@
                 if (currentSpeaker === 'user') {
                     currentSpeaker = 'none';
                 }
+                // Disconnect Live API
+                if (liveMode) {
+                    stopLiveSession();
+                }
+            }
+        };
+
+        // Toggle between Live API and REST modes
+        window.toggleLiveMode = function() {
+            if (liveMode) {
+                stopLiveSession();
+                log('Switched to REST mode (chat + TTS)', 'info');
+            } else {
+                if (!sessionId) {
+                    log('Initialize session first', 'warning');
+                    return;
+                }
+                startLiveSession();
+                log('Switched to Live API mode (real-time voice)', 'info');
             }
         };
 
