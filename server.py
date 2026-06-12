@@ -15,8 +15,8 @@ Key Features:
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import google.generativeai as genai
-from google.cloud import texttospeech_v1
+from google import genai
+from google.genai import types
 import os
 from dotenv import load_dotenv
 import time
@@ -25,6 +25,7 @@ import asyncio
 import threading
 from queue import Queue
 import re
+import wave
 
 # Initialize Flask app with CORS support
 app = Flask(__name__, static_folder='.', static_url_path='')
@@ -39,10 +40,17 @@ CORS(app, resources={
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize Text-to-Speech client with API key
-tts_client = texttospeech_v1.TextToSpeechClient(
-    client_options={"api_key": os.getenv('GOOGLE_API_KEY')}
-)
+# Lazy initializer for GenAI client
+genai_client = None
+
+def get_genai_client():
+    global genai_client
+    if genai_client is None:
+        api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GOOGLE_GENERATIVE_LANGUAGE_API_KEY')
+        if not api_key:
+            raise Exception("GOOGLE_API_KEY is not configured in the environment variables.")
+        genai_client = genai.Client(api_key=api_key)
+    return genai_client
 
 # Task processing queue and patterns
 task_queue = Queue()
@@ -127,15 +135,16 @@ def clean_text_for_speech(text):
     
     return text
 
-def generate_speech(text):
+def generate_speech(text, voice_name="Puck"):
     """
-    Generate high-quality speech from text using Google Cloud TTS.
+    Generate high-quality speech from text using Google's native Gemini conversational TTS model.
     
     Args:
         text (str): The text to convert to speech
+        voice_name (str): The name of the voice configuration to use
         
     Returns:
-        bytes: The audio content in MP3 format
+        bytes: The audio content in WAV format
         
     Raises:
         Exception: If speech generation fails
@@ -144,31 +153,41 @@ def generate_speech(text):
         # Clean the text before synthesis
         cleaned_text = clean_text_for_speech(text)
         
-        synthesis_input = texttospeech_v1.SynthesisInput(text=cleaned_text)
+        # Call Gemini TTS Model
+        client = get_genai_client()
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=cleaned_text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
+                    )
+                )
+            )
+        )
         
-        # Configure voice parameters for high quality output
-        voice = texttospeech_v1.VoiceSelectionParams(
-            language_code="en-US",
-            name="en-US-Studio-O",  # Studio voice for highest quality
-            ssml_gender=texttospeech_v1.SsmlVoiceGender.FEMALE
-        )
-
-        # Configure audio parameters for optimal quality
-        audio_config = texttospeech_v1.AudioConfig(
-            audio_encoding=texttospeech_v1.AudioEncoding.MP3,
-            speaking_rate=1.0,
-            pitch=0.0,
-            sample_rate_hertz=24000,
-            effects_profile_id=["headphone-class-device"]
-        )
-
-        response = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-
-        return response.audio_content
+        audio_data = None
+        for part in response.candidates[0].content.parts:
+            if part.inline_data:
+                audio_data = part.inline_data.data
+                break
+                
+        if not audio_data:
+            raise Exception("No audio data returned from Gemini TTS")
+            
+        # Convert raw linear PCM (16-bit, 24kHz mono) to WAV format
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, 'wb') as wav_file:
+            wav_file.setnchannels(1)      # Mono
+            wav_file.setsampwidth(2)      # 16-bit
+            wav_file.setframerate(24000)  # 24kHz
+            wav_file.writeframes(audio_data)
+            
+        return wav_buf.getvalue()
     except Exception as e:
         raise Exception(f"Failed to generate speech: {str(e)}")
 
@@ -180,51 +199,54 @@ def init_gemini(api_key):
         api_key (str): The Gemini API key
         
     Returns:
-        genai.ChatSession: Initialized chat session
+        google.genai.chats.Chat: Initialized chat session
         
     Raises:
         Exception: If initialization fails
     """
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash',
-            generation_config={
-                "temperature": 0.7,
-                "top_p": 1,
-                "top_k": 1,
-                "max_output_tokens": 150,
-            },
-            safety_settings=[
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                }
+        client = get_genai_client()
+        chat = client.chats.create(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                top_p=1.0,
+                top_k=1,
+                max_output_tokens=2048,
+                safety_settings=[
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE
+                    ),
+                ]
+            ),
+            history=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(
+                        text="I want you to act as an advanced real-time conversational voice and text assistant. Be warm, natural, engaging, and highly conversational. You are frequently used as an acting practice partner, customer service agent, or general conversational assistant. When we are practicing acting or roleplaying, fully adapt to your character, deliver complete lines, express appropriate emotions, and feel free to generate longer, descriptive script segments, lines, or monologues as needed. Otherwise, keep your responses naturally conversational and moderate (1 to 3 sentences max) so that our live conversation flows quickly and naturally. Never use markdown formatting, bullet points, or list structures. Respond naturally like a human would in a live voice conversation."
+                    )]
+                ),
+                types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Understood! I will be a warm, natural, and engaging conversational partner. By default, I'll keep my answers moderate and conversational (1 to 3 sentences) so the dialogue flows smoothly, but I'll adapt fully to deliver complete script lines, monologues, or customer service roleplay whenever we are practicing scenes. What scenario or character would you like to start with?"
+                    )]
+                )
             ]
         )
-
-        # Initialize chat with professional assistant context
-        chat = model.start_chat(history=[
-            {
-                "role": "user",
-                "parts": ["I want you to act as a professional AI assistant like Siri. Be helpful, efficient, and focused on tasks. When I ask you to take notes or create documents, maintain those in a list. Keep responses clear and professional."]
-            },
-            {
-                "role": "model",
-                "parts": ["I'll assist you professionally with your tasks. How can I help you today?"]
-            }
-        ])
         
         return chat
     except Exception as e:
@@ -256,7 +278,7 @@ def init_session():
         return '', 204
     try:
         # Use API key from environment variables
-        api_key = os.getenv('GOOGLE_GENERATIVE_LANGUAGE_API_KEY')
+        api_key = os.getenv('GOOGLE_GENERATIVE_LANGUAGE_API_KEY') or os.getenv('GOOGLE_API_KEY')
         
         if not api_key:
             return jsonify({'error': 'API key not found in environment variables'}), 400
@@ -291,20 +313,47 @@ def synthesize_speech():
         if not text:
             return jsonify({'error': 'Text is required'}), 400
 
-        audio_content = generate_speech(text)
+        session_id = request.headers.get('Session-ID')
+        voice_name = 'Puck'
+        if session_id and session_id in chat_sessions:
+            voice_name = chat_sessions[session_id].get('voice', 'Puck')
+
+        audio_content = generate_speech(text, voice_name=voice_name)
         
         return send_file(
             io.BytesIO(audio_content),
-            mimetype='audio/mp3',
+            mimetype='audio/wav',
             as_attachment=True,
-            download_name='response.mp3'
+            download_name='response.wav'
         )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/settings', methods=['POST', 'OPTIONS'])
+def update_settings():
+    """Update settings for the active session"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        session_id = request.headers.get('Session-ID')
+        if not session_id or session_id not in chat_sessions:
+            return jsonify({'error': 'Invalid session'}), 400
+        
+        data = request.json
+        voice = data.get('voice')
+        if voice:
+            chat_sessions[session_id]['voice'] = voice
+            
+        return jsonify({
+            'status': 'success',
+            'voice': chat_sessions[session_id].get('voice', 'Puck')
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
-    """Handle chat messages and generate responses"""
+    """Handle chat messages and generate responses as a text stream"""
     if request.method == 'OPTIONS':
         return '', 204
     try:
@@ -321,7 +370,6 @@ def chat():
 
         # Check for principal commands
         command_type, command_content = check_principal_command(message)
-        task_added = False
         
         if command_type:
             # Add task to processing queue
@@ -332,40 +380,31 @@ def chat():
                 'status': 'pending'
             }
             task_queue.put((session_id, task))
-            task_added = True
 
         # Get chat session
         session = chat_sessions[session_id]
-        chat = session['chat']
+        chat_obj = session['chat']
 
-        # Generate response
-        response = chat.send_message(message)
-        
-        # Update conversation history
-        if 'history' not in session:
-            session['history'] = []
-        
-        session['history'].append({
-            'user': message,
-            'ai': response.text
-        })
+        def generate():
+            full_response = []
+            try:
+                for chunk in chat_obj.send_message_stream(message):
+                    text_part = chunk.text
+                    if text_part:
+                        full_response.append(text_part)
+                        yield text_part
+            except Exception as e:
+                yield f"\n[STREAM_ERROR: {str(e)}]"
+            
+            # Save history
+            if 'history' not in session:
+                session['history'] = []
+            session['history'].append({
+                'user': message,
+                'ai': "".join(full_response)
+            })
 
-        # Generate speech for response
-        try:
-            audio_content = generate_speech(response.text)
-            audio_base64 = audio_content.hex()
-        except Exception as e:
-            audio_base64 = None
-            print(f"Speech synthesis error: {e}")
-        
-        return jsonify({
-            'response': response.text,
-            'audio': audio_base64,
-            'status': 'success',
-            'task_added': task_added,
-            'command_type': command_type,
-            'command_content': command_content
-        })
+        return app.response_class(generate(), mimetype='text/plain')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
